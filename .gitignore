@@ -274,4 +274,7 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks,jetbrains+all
 
+# notebook and script outputs
 *.zarr
+*.csv
+*.png

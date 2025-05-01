@@ -8,19 +8,28 @@
 # ]
 # ///
 # !/usr/bin/env python3
-"""Compare write performance of TensorStore vs. acquire-zarr for a Zarr v3 store. Thanks to Talley Lambert @tlambert03
-for the original version of this script: https://gist.github.com/tlambert03/f8c1b069c2947b411ce24ea05aa370b1"""
+"""Compare write performance of TensorStore vs. acquire-zarr for a Zarr v3 store.
+
+Runs multiple iterations of the comparison to generate distribution data and visualizes results.
+
+Thanks to Talley Lambert @tlambert03 for the original version of this script:
+https://gist.github.com/tlambert03/f8c1b069c2947b411ce24ea05aa370b1
+"""
 
 from pathlib import Path
 import sys
 import time
-from typing import Tuple
+import shutil
+import os
+from typing import Tuple, Dict, List
 
 import acquire_zarr as aqz
 import numpy as np
 import tensorstore
 import zarr
 from rich import print
+import matplotlib.pyplot as plt
+import pandas as pd
 
 
 class CyclicArray:
@@ -45,7 +54,6 @@ class CyclicArray:
         for i in range(0, arr.shape[0], self.t):
             start = i
             stop = min(i + self.t, arr.shape[0])
-            # print(f"Comparing 0:{stop - start} to {start}:{stop}")
             np.testing.assert_array_equal(
                 self.data[0: (stop - start)], arr[start:stop]
             )
@@ -160,28 +168,47 @@ def run_acquire_zarr_test(
     return tot_ms, np.array(elapsed_times) / 1e6
 
 
-def compare(
+def cleanup_test_directories():
+    """Remove test directories to clean up between runs."""
+    dirs_to_remove = ["acquire_zarr_test.zarr", "tensorstore_test.zarr"]
+    for dir_path in dirs_to_remove:
+        if os.path.exists(dir_path):
+            try:
+                if os.path.isdir(dir_path):
+                    shutil.rmtree(dir_path)
+                else:
+                    os.remove(dir_path)
+                print(f"Removed {dir_path}")
+            except Exception as e:
+                print(f"Error removing {dir_path}: {e}")
+
+
+def run_single_comparison(
         t_chunk_size: int, xy_chunk_size: int, xy_shard_size: int, frame_count: int
-) -> None:
+) -> dict:
+    """Run a single comparison and return the results as a dictionary."""
     print("tchunk_size:", t_chunk_size)
     print("xy_chunk_size:", xy_chunk_size)
     print("xy_shard_size:", xy_shard_size)
     print("frame_count:", frame_count)
-    print("\nRunning acquire-zarr test:")
-    az_path = "acquire_zarr_test.zarr"
-    print("I'm saving to ", Path(az_path).absolute())
 
     # Pre-generate the data (timing excluded)
     data = CyclicArray(
         np.random.randint(0, 2 ** 16 - 1, (128, 2048, 2048), dtype=np.uint16), frame_count
     )
 
-    time_az_ms, frame_write_times_az = run_acquire_zarr_test(data, az_path, t_chunk_size, xy_chunk_size)
+    # Run acquire-zarr test
+    print("\nRunning acquire-zarr test:")
+    az_path = "acquire_zarr_test.zarr"
+    print("Saving to", Path(az_path).absolute())
+    time_az_ms, frame_write_times_az = run_acquire_zarr_test(
+        data, az_path, t_chunk_size, xy_chunk_size, xy_shard_size
+    )
 
-    # use the exact same metadata that was used for the acquire-zarr test
-    # to ensure we're using the same chunks and codecs, etc...
+    # Use the same metadata for TensorStore
     az = zarr.open(az_path)["0"]
 
+    # Run TensorStore test
     print("\nRunning TensorStore test:")
     ts_path = "tensorstore_test.zarr"
     time_ts_ms, frame_write_times_ts = run_tensorstore_test(
@@ -190,38 +217,159 @@ def compare(
         {**az.metadata.to_dict(), "data_type": "uint16"},
     )
 
-    # ensure that the data is written to disk and that they are the same
-
-    # print("\nComparing the written data:", end=" ")
-
+    # Verify metadata matches
     ts = zarr.open(ts_path)
-    # data.compare_array(az)  # ensure acquire-zarr wrote the correct data
-    # data.compare_array(ts)  # ensure tensorstore wrote the correct data
-    # print("✅\n")
-
     assert ts.metadata == az.metadata
-    print("Metadata matches:")
-    print(ts.metadata)
+    print("Metadata matches")
 
+    # Calculate throughput
     data_size_gib = (2048 * 2048 * 2 * frame_count) / (1 << 30)
+    az_throughput = 1000 * data_size_gib / time_az_ms
+    ts_throughput = 1000 * data_size_gib / time_ts_ms
+    ts_az_ratio = time_ts_ms / time_az_ms
 
+    # Print performance comparison
     print("\nPerformance comparison:")
     print(
-        f"  acquire-zarr: {time_az_ms:.3f} ms, {1000 * data_size_gib / time_az_ms:.3f} GiB/s, 50th percentile frame write time: {np.percentile(frame_write_times_az, 50):.3f} ms, 99th percentile: {np.percentile(frame_write_times_az, 99):.3f} ms"
+        f"  acquire-zarr: {time_az_ms:.3f} ms, {az_throughput:.3f} GiB/s, "
+        f"50th percentile frame write time: {np.percentile(frame_write_times_az, 50):.3f} ms, "
+        f"99th percentile: {np.percentile(frame_write_times_az, 99):.3f} ms"
     )
     print(
-        f"  TensorStore: {time_ts_ms:.3f} ms, {1000 * data_size_gib / time_ts_ms:.3f} GiB/s, 50th percentile frame write time: {np.percentile(frame_write_times_ts, 50):.3f} ms, 99th percentile: {np.percentile(frame_write_times_ts, 99):.3f} ms"
+        f"  TensorStore: {time_ts_ms:.3f} ms, {ts_throughput:.3f} GiB/s, "
+        f"50th percentile frame write time: {np.percentile(frame_write_times_ts, 50):.3f} ms, "
+        f"99th percentile: {np.percentile(frame_write_times_ts, 99):.3f} ms"
     )
-    print(f"  TS/AZ Ratio: {time_ts_ms / time_az_ms:.3f}")
+    print(f"  TS/AZ Ratio: {ts_az_ratio:.3f}")
+
+    # Return results
+    return {
+        "acquire_zarr_time_ms": time_az_ms,
+        "tensorstore_time_ms": time_ts_ms,
+        "acquire_zarr_throughput_gibs": az_throughput,
+        "tensorstore_throughput_gibs": ts_throughput,
+        "ts_az_ratio": ts_az_ratio,
+        "acquire_zarr_frame_times": frame_write_times_az,
+        "tensorstore_frame_times": frame_write_times_ts,
+        "acquire_zarr_p50_ms": np.percentile(frame_write_times_az, 50),
+        "acquire_zarr_p99_ms": np.percentile(frame_write_times_az, 99),
+        "tensorstore_p50_ms": np.percentile(frame_write_times_ts, 50),
+        "tensorstore_p99_ms": np.percentile(frame_write_times_ts, 99),
+    }
+
+
+def visualize_results(all_results: List[dict]):
+    """Visualize the results of multiple benchmark runs."""
+    # Convert results to DataFrame
+    df = pd.DataFrame(all_results)
+
+    # Create figure with multiple subplots
+    fig, axs = plt.subplots(2, 2, figsize=(15, 12))
+
+    # Plot 1: Total execution time comparison
+    axs[0, 0].boxplot([df['acquire_zarr_time_ms'], df['tensorstore_time_ms']])
+    axs[0, 0].set_title('Total Execution Time (ms)')
+    axs[0, 0].set_xticklabels(['acquire-zarr', 'TensorStore'])
+    axs[0, 0].grid(True)
+
+    # Plot 2: Throughput comparison
+    axs[0, 1].boxplot([df['acquire_zarr_throughput_gibs'], df['tensorstore_throughput_gibs']])
+    axs[0, 1].set_title('Throughput (GiB/s)')
+    axs[0, 1].set_xticklabels(['acquire-zarr', 'TensorStore'])
+    axs[0, 1].grid(True)
+
+    # Plot 3: Frame write time percentiles
+    p50_p99_data = [
+        df['acquire_zarr_p50_ms'],
+        df['acquire_zarr_p99_ms'],
+        df['tensorstore_p50_ms'],
+        df['tensorstore_p99_ms']
+    ]
+
+    # Create boxplot
+    bp = axs[1, 0].boxplot(p50_p99_data, patch_artist=True)
+
+    # Set colors for boxplots
+    colors = ['lightblue', 'blue', 'lightgreen', 'green']
+    for patch, color in zip(bp['boxes'], colors):
+        patch.set_facecolor(color)
+
+    axs[1, 0].set_title('Frame Write Time Percentiles (ms)')
+    axs[1, 0].set_xticklabels(['AZ p50', 'AZ p99', 'TS p50', 'TS p99'])
+    axs[1, 0].grid(True, linestyle='--', alpha=0.7)
+
+    # Plot 4: TS/AZ ratio
+    axs[1, 1].boxplot(df['ts_az_ratio'])
+    axs[1, 1].set_title('TensorStore/acquire-zarr Time Ratio')
+    axs[1, 1].set_xticklabels(['TS/AZ Ratio'])
+    axs[1, 1].axhline(y=1.0, color='r', linestyle='--', label='Equal performance')
+    axs[1, 1].grid(True)
+    axs[1, 1].legend()
+
+    plt.tight_layout()
+    plt.savefig('benchmark_results.png')
+    print("Results visualization saved to 'benchmark_results.png'")
+
+    # Also save raw data
+    df.to_csv('benchmark_results.csv', index=False)
+    print("Raw results saved to 'benchmark_results.csv'")
+
+    # Print summary statistics
+    print("\nSUMMARY STATISTICS:")
+    print(f"Number of benchmark runs: {len(all_results)}")
+    print("\nAcquire-zarr:")
+    print(f"  Mean total time: {df['acquire_zarr_time_ms'].mean():.2f} ms")
+    print(f"  Mean throughput: {df['acquire_zarr_throughput_gibs'].mean():.2f} GiB/s")
+    print(f"  Mean p50 frame time: {df['acquire_zarr_p50_ms'].mean():.2f} ms")
+    print(f"  Mean p99 frame time: {df['acquire_zarr_p99_ms'].mean():.2f} ms")
+
+    print("\nTensorStore:")
+    print(f"  Mean total time: {df['tensorstore_time_ms'].mean():.2f} ms")
+    print(f"  Mean throughput: {df['tensorstore_throughput_gibs'].mean():.2f} GiB/s")
+    print(f"  Mean p50 frame time: {df['tensorstore_p50_ms'].mean():.2f} ms")
+    print(f"  Mean p99 frame time: {df['tensorstore_p99_ms'].mean():.2f} ms")
+
+    print(f"\nMean TS/AZ Ratio: {df['ts_az_ratio'].mean():.2f}")
+
+    return fig
 
 
 def main():
+    """Run multiple benchmark comparisons and visualize the results."""
+    # Parse command line arguments
     T_CHUNK_SIZE = int(sys.argv[1]) if len(sys.argv) > 1 else 64
     XY_CHUNK_SIZE = int(sys.argv[2]) if len(sys.argv) > 2 else 64
     XY_SHARD_SIZE = int(sys.argv[3]) if len(sys.argv) > 3 else 16
     FRAME_COUNT = int(sys.argv[4]) if len(sys.argv) > 4 else 1024
+    NUM_RUNS = int(sys.argv[5]) if len(sys.argv) > 5 else 20
 
-    compare(T_CHUNK_SIZE, XY_CHUNK_SIZE, XY_SHARD_SIZE, FRAME_COUNT)
+    print(f"Running {NUM_RUNS} benchmark iterations with parameters:")
+    print(f"  T_CHUNK_SIZE: {T_CHUNK_SIZE}")
+    print(f"  XY_CHUNK_SIZE: {XY_CHUNK_SIZE}")
+    print(f"  XY_SHARD_SIZE: {XY_SHARD_SIZE}")
+    print(f"  FRAME_COUNT: {FRAME_COUNT}")
+
+    # Collect results from multiple runs
+    all_results = []
+
+    for run_idx in range(NUM_RUNS):
+        print(f"\n\n--- BENCHMARK RUN {run_idx + 1}/{NUM_RUNS} ---\n")
+
+        # Clean up from previous run
+        cleanup_test_directories()
+
+        # Run comparison and collect results
+        run_results = run_single_comparison(T_CHUNK_SIZE, XY_CHUNK_SIZE, XY_SHARD_SIZE, FRAME_COUNT)
+        all_results.append(run_results)
+
+        # Add run index to results
+        run_results['run_idx'] = run_idx
+
+    # Clean up after all runs
+    cleanup_test_directories()
+
+    # Visualize results
+    visualize_results(all_results)
 
 
 if __name__ == "__main__":
