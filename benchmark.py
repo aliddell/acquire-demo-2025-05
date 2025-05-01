@@ -119,6 +119,12 @@ def run_acquire_zarr_test(
         store_path=path,
         data_type=aqz.DataType.UINT16,
         version=aqz.ZarrVersion.V3,
+        compression=aqz.CompressionSettings(
+            codec=aqz.CompressionCodec.BLOSC_ZSTD,
+            compressor=aqz.Compressor.BLOSC1,
+            compression_level=3,
+            shuffle=0
+        )
     )
     settings.dimensions.extend(
         [
